@@ -1,0 +1,5 @@
+# autovacanalyze_check extension
+comment = 'checks if tables needs analyze or vacuum'
+default_version = '1.0'
+module_pathname = '$libdir/autovacanalyze_check'
+relocatable = true
