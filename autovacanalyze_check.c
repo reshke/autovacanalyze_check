@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
- * pg_tm_aux.c
- *		Transfer manager auxilary functions
+ * autovacanalyze_check.c
+ *		Check which tables needs vacuum or analyze
  *
  *-------------------------------------------------------------------------
  */
@@ -16,7 +16,9 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/reloptions.h"
+#if PG_VERSION_NUM >= 120000
 #include "access/tableam.h"
+#endif
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
@@ -31,7 +33,9 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/fork_process.h"
+#if PG_VERSION_NUM >= 130000
 #include "postmaster/interrupt.h"
+#endif
 #include "postmaster/postmaster.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
@@ -77,7 +81,7 @@ autovacananlyze_check_tupdesc()
 	TupleDesc	tupdesc;
 	AttrNumber	maxattr = 3;
 
-	tupdesc = CreateTemplateTupleDesc(maxattr);
+	tupdesc = CreateTemplateTupleDesc(maxattr, true);
 	TupleDescInitEntry(tupdesc, 1, "relation_oid", OIDOID, -1, 0);
 	TupleDescInitEntry(tupdesc, 2, "need_vacuum", BOOLOID, -1, 0);
 	TupleDescInitEntry(tupdesc, 3, "need_analyze", BOOLOID, -1, 0);
@@ -176,20 +180,24 @@ relation_needs_vacanalyze(Oid relid,
 
 	/* constants from reloptions or GUC variables */
 	int			vac_base_thresh,
-				vac_ins_base_thresh,
 				anl_base_thresh;
 	float4		vac_scale_factor,
-				vac_ins_scale_factor,
 				anl_scale_factor;
 
 	/* thresholds calculated from above constants */
 	float4		vacthresh,
-				vacinsthresh,
 				anlthresh;
+
+
+#if PG_VERSION_NUM >= 130000
+	float4		vacinsthresh,
+				vac_ins_base_thresh,
+				instuples,
+				vac_ins_scale_factor;
+#endif 
 
 	/* number of vacuum (resp. analyze) tuples at this time */
 	float4		vactuples,
-				instuples,
 				anltuples;
 
 	/* freeze parameters */
@@ -210,7 +218,11 @@ relation_needs_vacanalyze(Oid relid,
 	 * table), or the autovacuum GUC variables.
 	 */
 
+#if PG_VERSION_NUM >= 140000
 	recentXid = ReadNextTransactionId();
+#else
+	recentXid = ReadNewTransactionId();
+#endif
 	recentMulti = ReadNextMultiXactId();
 
 
@@ -223,6 +235,7 @@ relation_needs_vacanalyze(Oid relid,
 		? relopts->vacuum_threshold
 		: autovacuum_vac_thresh;
 
+#if PG_VERSION_NUM >= 130000
 	vac_ins_scale_factor = (relopts && relopts->vacuum_ins_scale_factor >= 0)
 		? relopts->vacuum_ins_scale_factor
 		: autovacuum_vac_ins_scale;
@@ -231,6 +244,7 @@ relation_needs_vacanalyze(Oid relid,
 	vac_ins_base_thresh = (relopts && relopts->vacuum_ins_threshold >= -1)
 		? relopts->vacuum_ins_threshold
 		: autovacuum_vac_ins_thresh;
+#endif 
 
 	anl_scale_factor = (relopts && relopts->analyze_scale_factor >= 0)
 		? relopts->analyze_scale_factor
@@ -286,7 +300,9 @@ relation_needs_vacanalyze(Oid relid,
 	{
 		reltuples = classForm->reltuples;
 		vactuples = tabentry->n_dead_tuples;
+#if PG_VSERION_NUM >= 130000
 		instuples = tabentry->inserts_since_vacuum;
+#endif
 		anltuples = tabentry->changes_since_analyze;
 
 		/* If the table hasn't yet been vacuumed, take reltuples as zero */
@@ -294,9 +310,15 @@ relation_needs_vacanalyze(Oid relid,
 			reltuples = 0;
 
 		vacthresh = (float4) vac_base_thresh + vac_scale_factor * reltuples;
+
+#if PG_VERSION_NUM >= 130000
 		vacinsthresh = (float4) vac_ins_base_thresh + vac_ins_scale_factor * reltuples;
+#endif
+
 		anlthresh = (float4) anl_base_thresh + anl_scale_factor * reltuples;
 
+
+#if PG_VERSION_NUM >= 130000
 		/*
 		 * Note that we don't need to take special consideration for stat
 		 * reset, because if that happens, the last vacuum and analyze counts
@@ -315,6 +337,20 @@ relation_needs_vacanalyze(Oid relid,
 		*dovacuum = force_vacuum || (vactuples > vacthresh) ||
 			(vac_ins_base_thresh >= 0 && instuples > vacinsthresh);
 		*doanalyze = (anltuples > anlthresh);
+#else
+				/*
+		 * Note that we don't need to take special consideration for stat
+		 * reset, because if that happens, the last vacuum and analyze counts
+		 * will be reset too.
+		 */
+		elog(DEBUG3, "%s: vac: %.0f (threshold %.0f), ins: (disabled), anl: %.0f (threshold %.0f)",
+				 NameStr(classForm->relname),
+				 vactuples, vacthresh, anltuples, anlthresh);
+
+		/* Determine if this table needs vacuum or analyze. */
+		*dovacuum = force_vacuum || (vactuples > vacthresh);
+		*doanalyze = (anltuples > anlthresh);
+#endif
 	}
 	else
 	{
@@ -332,6 +368,35 @@ relation_needs_vacanalyze(Oid relid,
 		*doanalyze = false;
 }
 
+#if PG_VERSION_NUM >= 150000
+
+#else
+/*
+ * get_pgstat_tabentry_relid
+ *
+ * Fetch the pgstat entry of a table, either local to a database or shared.
+ */
+static PgStat_StatTabEntry *
+get_pgstat_tabentry_relid(Oid relid, bool isshared, PgStat_StatDBEntry *shared,
+						  PgStat_StatDBEntry *dbentry)
+{
+	PgStat_StatTabEntry *tabentry = NULL;
+
+	if (isshared)
+	{
+		if (PointerIsValid(shared))
+			tabentry = hash_search(shared->tables, &relid,
+								   HASH_FIND, NULL);
+	}
+	else if (PointerIsValid(dbentry))
+		tabentry = hash_search(dbentry->tables, &relid,
+							   HASH_FIND, NULL);
+
+	return tabentry;
+}
+
+#endif 
+
 /*
  * SQL function to check if tables need autovac or autoanalyze.
  */
@@ -341,7 +406,11 @@ autovacanalyze_check_internal(PG_FUNCTION_ARGS)
 {
 	Relation	classRel;
 	HeapTuple	tuple;
+#if PG_VERSION_NUM >= 120000
 	TableScanDesc relScan;
+#else
+	HeapScanDesc relScan;
+#endif
 	List	   *table_oids = NIL;
 	List	   *relations_meta = NIL;
 	List	   *orphan_oids = NIL;
@@ -355,15 +424,39 @@ autovacanalyze_check_internal(PG_FUNCTION_ARGS)
 	bool		nulls[3];
 	MemoryContext mctx;
 	FuncCallContext *fctx;
+#if PG_VERSION_NUM >= 150000
+#else
+	PgStat_StatDBEntry *shared;
+	PgStat_StatDBEntry *dbentry;
+#endif
+
 
 	if (SRF_IS_FIRSTCALL())
 	{
+
+#if PG_VERSION_NUM >= 150000
+#else
+
+		/*
+		* may be NULL if we couldn't find an entry (only happens if we are
+		* forcing a vacuum for anti-wrap purposes).
+		*/
+		dbentry = pgstat_fetch_stat_dbentry(MyDatabaseId);
+
+		/* The database hash where pgstat keeps shared relations */
+		shared = pgstat_fetch_stat_dbentry(InvalidOid);
+#endif
+
 		fctx = SRF_FIRSTCALL_INIT();
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
 
 		effective_multixact_freeze_max_age = MultiXactMemberFreezeThreshold();
 
+#if 	PG_VERSION_NUM >= 120000
 		classRel = table_open(RelationRelationId, AccessShareLock);
+#else
+		classRel = heap_open(RelationRelationId, AccessShareLock);
+#endif
 
 		/* create a copy so we can use it after closing pg_class */
 		pg_class_desc = CreateTupleDescCopy(RelationGetDescr(classRel));
@@ -382,7 +475,11 @@ autovacanalyze_check_internal(PG_FUNCTION_ARGS)
 		* wide tables there might be proportionally much more activity in the
 		* TOAST table than in its parent.
 		*/
+#if 	PG_VERSION_NUM >= 120000
 		relScan = table_beginscan_catalog(classRel, 0, NULL);
+#else
+		relScan = heap_beginscan_catalog(classRel, 0, NULL);
+#endif
 
 		/*
 		* On the first pass, we collect main tables to vacuum, and also the main
@@ -402,8 +499,11 @@ autovacanalyze_check_internal(PG_FUNCTION_ARGS)
 				classForm->relkind != RELKIND_MATVIEW)
 				continue;
 
+#if 		PG_VERSION_NUM >= 120000
 			relid = classForm->oid;
-
+#else
+			relid = HeapTupleGetOid(tuple);
+#endif
 			/*
 			* Check if it is a temp table (presumably, of some other backend's).
 			* We cannot safely process other backends' temp tables.
@@ -431,8 +531,14 @@ autovacanalyze_check_internal(PG_FUNCTION_ARGS)
 
 			/* Fetch reloptions and the pgstat entry for this table */
 			relopts = extract_autovac_opts(tuple, pg_class_desc);
+#if PG_VERSION_NUM >= 150000
 			tabentry = pgstat_fetch_stat_tabentry_ext(classForm->relisshared,
 													relid);
+#else
+			/* Fetch the pgstat entry for this table */
+			tabentry = get_pgstat_tabentry_relid(relid, classForm->relisshared,
+											 shared, dbentry);
+#endif
 
 			/* Check if it needs vacuum or analyze */
 			relation_needs_vacanalyze(relid, relopts, classForm, tabentry,
@@ -451,8 +557,13 @@ autovacanalyze_check_internal(PG_FUNCTION_ARGS)
 			}
 		}
 
+#if 	PG_VERSION_NUM >= 120000
 		table_endscan(relScan);
 		table_close(classRel, AccessShareLock);
+#else
+		heap_endscan(relScan);
+		heap_close(classRel, AccessShareLock);
+#endif
 
 		fctx->user_fctx = relations_meta;
 		fctx->call_cntr = 0;
