@@ -81,7 +81,11 @@ autovacananlyze_check_tupdesc()
 	TupleDesc	tupdesc;
 	AttrNumber	maxattr = 3;
 
+#if PG_VERSION_NUM >= 120000
+	tupdesc = CreateTemplateTupleDesc(maxattr);
+#else
 	tupdesc = CreateTemplateTupleDesc(maxattr, true);
+#endif
 	TupleDescInitEntry(tupdesc, 1, "relation_oid", OIDOID, -1, 0);
 	TupleDescInitEntry(tupdesc, 2, "need_vacuum", BOOLOID, -1, 0);
 	TupleDescInitEntry(tupdesc, 3, "need_analyze", BOOLOID, -1, 0);
