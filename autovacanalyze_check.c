@@ -50,7 +50,9 @@
 #include "utils/rel.h"
 #include "tcop/tcopprot.h"
 #include "utils/fmgroids.h"
+#if PG_VERSION_NUM >= 100000
 #include "utils/fmgrprotos.h"
+#endif
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
@@ -118,7 +120,11 @@ extract_autovac_opts(HeapTuple tup, TupleDesc pg_class_desc)
 		   ((Form_pg_class) GETSTRUCT(tup))->relkind == RELKIND_MATVIEW ||
 		   ((Form_pg_class) GETSTRUCT(tup))->relkind == RELKIND_TOASTVALUE);
 
+#if PG_VERSION_NUM >= 96000
 	relopts = extractRelOptions(tup, pg_class_desc, NULL);
+#else
+	relopts = extractRelOptions(tup, pg_class_desc, InvalidOid);
+#endif
 	if (relopts == NULL)
 		return NULL;
 
@@ -417,7 +423,6 @@ autovacanalyze_check_internal(PG_FUNCTION_ARGS)
 #endif
 	List	   *table_oids = NIL;
 	List	   *relations_meta = NIL;
-	List	   *orphan_oids = NIL;
 	TupleDesc	pg_class_desc;
 	int			effective_multixact_freeze_max_age;
 	vacanalyze_meta * tmp;
@@ -515,21 +520,9 @@ autovacanalyze_check_internal(PG_FUNCTION_ARGS)
 			if (classForm->relpersistence == RELPERSISTENCE_TEMP)
 			{
 				/*
-				* We just ignore it if the owning backend is still active and
-				* using the temporary schema.  Also, for safety, ignore it if the
-				* namespace doesn't exist or isn't a temp namespace after all.
+				* Just ingore this relation, leftover orphan tables cleanup 
+				* is not our point of interest here.
 				*/
-				if (checkTempNamespaceStatus(classForm->relnamespace) == TEMP_NAMESPACE_IDLE)
-				{
-					/*
-					* The table seems to be orphaned -- although it might be that
-					* the owning backend has already deleted it and exited; our
-					* pg_class scan snapshot is not necessarily up-to-date
-					* anymore, so we could be looking at a committed-dead entry.
-					* Remember it so we can try to delete it later.
-					*/
-					orphan_oids = lappend_oid(orphan_oids, relid);
-				}
 				continue;
 			}
 
